@@ -1,0 +1,21 @@
+name: PR Title
+
+# Enforce Conventional-Commit PR titles. Feature PRs squash-merge into `main`, so
+# the title becomes the commit python-semantic-release reads at release time — a
+# bad title = no release for that change.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
