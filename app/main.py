@@ -59,8 +59,32 @@ class Components:
     tautulli: Any = None
 
 
+def _when_plex_reachable(plex: Any, job: str, fn: Any) -> Any:
+    """Wrap a scheduled job so it is skipped (one log line) while Plex is down.
+
+    The Plex client connects lazily, so the app starts even when Plex is
+    unreachable; each run retries the connection and the job resumes on its own
+    once Plex answers. Returning None leaves the job's last status untouched.
+    """
+    from app.clients.plex import PlexUnavailableError
+
+    def runner() -> Any:
+        try:
+            plex.connect()
+        except PlexUnavailableError as exc:
+            log.warning("Skipping %s: %s", job, exc)
+            return None
+        return fn()
+
+    return runner
+
+
 def build_components(settings: Settings, tracker: Any | None = None) -> Components:
-    """Construct clients and services from settings (performs network connect)."""
+    """Construct clients and services from settings.
+
+    No network I/O happens here: every client connects lazily on first use, so an
+    unreachable service can't stop the app from starting.
+    """
     from app.clients.notify import Notifier
     from app.clients.plex import PlexClient
     from app.clients.radarr import RadarrClient
@@ -143,9 +167,13 @@ def build_components(settings: Settings, tracker: Any | None = None) -> Componen
 
     reactive = ReactivePoller(plex=plex, label_sync=label_sync, radarr=radarr, sonarr=sonarr)
 
-    sweep_fn = label_sync.sweep
-    watch_fn = watch_monitor.scan if watch_monitor else (lambda: None)
-    reactive_fn = reactive.poll
+    sweep_fn = _when_plex_reachable(plex, "sweep", label_sync.sweep)
+    watch_fn = (
+        _when_plex_reachable(plex, "watch scan", watch_monitor.scan)
+        if watch_monitor
+        else (lambda: None)
+    )
+    reactive_fn = _when_plex_reachable(plex, "reactive poll", reactive.poll)
     if tracker is not None:
         sweep_fn = tracker.wrap("sweep", sweep_fn)
         reactive_fn = tracker.wrap("reactive", reactive_fn)

@@ -7,10 +7,16 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
+import socket
+import threading
 import time
 from collections.abc import Iterator
 from datetime import datetime
+from typing import Any
+from urllib.parse import urlsplit
 
 from app.core.matching import extract_guids, guid_key, parse_legacy_guid
 
@@ -18,6 +24,82 @@ log = logging.getLogger(__name__)
 
 # Plex section type -> our media_type domain.
 _SECTION_TYPE = {"movie": "movie", "show": "show"}
+
+# After a failed connect, callers within this window get the same error straight
+# away instead of starting another attempt. Keeps a dead Plex (each attempt can
+# take plexapi's 30s timeout) from piling up blocked probe/job threads.
+_CONNECT_RETRY_SECONDS = 15.0
+
+# Plex's secure URLs encode the server's IPv4 address in the hostname, e.g.
+# ``10-0-0-11.<hash>.plex.direct`` -> 10.0.0.11.
+_PLEX_DIRECT_IPV4 = re.compile(r"^(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.[^.]+\.plex\.direct$")
+
+
+class PlexUnavailableError(Exception):
+    """Plex can't be connected to right now. ``str()`` is a log-friendly hint.
+
+    ``reason`` is a short, fixed code (``dns`` / ``unauthorized`` / ``unreachable``)
+    that is safe to show in the UI; the message itself is for the logs only.
+    """
+
+    def __init__(self, message: str, reason: str = "unreachable") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _is_dns_failure(exc: BaseException) -> bool:
+    """Whether a connection error was caused by a hostname that doesn't resolve."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, socket.gaierror) or type(cur).__name__ == "NameResolutionError":
+            return True
+        # requests/urllib3 wrap the original error in args as well as the chain.
+        nested = next((a for a in getattr(cur, "args", ()) if isinstance(a, BaseException)), None)
+        cur = cur.__cause__ or cur.__context__ or nested
+    return False
+
+
+def plex_direct_fallback_url(base_url: str) -> str | None:
+    """For a ``*.plex.direct`` URL, the plain ``http://<ip>:<port>`` it points at."""
+    parts = urlsplit(base_url)
+    match = _PLEX_DIRECT_IPV4.match((parts.hostname or "").lower())
+    if not match:
+        return None
+    try:
+        ip = ipaddress.IPv4Address(".".join(match.groups()))
+    except ValueError:
+        return None
+    return f"http://{ip}:{parts.port or 32400}"
+
+
+def describe_connect_error(base_url: str, exc: BaseException) -> PlexUnavailableError:
+    """Turn a raw connect failure into a one-line, actionable error."""
+    from plexapi.exceptions import Unauthorized
+
+    if isinstance(exc, Unauthorized):
+        return PlexUnavailableError(
+            f"Plex at {base_url} rejected the token (Unauthorized). "
+            "Sign in with Plex again or update PLEX_TOKEN.",
+            reason="unauthorized",
+        )
+    if _is_dns_failure(exc):
+        host = urlsplit(base_url).hostname or base_url
+        message = f"Can't reach Plex at {base_url}: the hostname {host} doesn't resolve."
+        if host.lower().endswith(".plex.direct"):
+            fallback = plex_direct_fallback_url(base_url)
+            message += (
+                " *.plex.direct names are commonly blocked by DNS-rebinding protection"
+                " (router, Pi-hole, AdGuard Home, Unbound). Allow plex.direct there, or set"
+                " the Plex URL to the server's address directly"
+                + (f", e.g. {fallback}." if fallback else ".")
+            )
+        return PlexUnavailableError(message, reason="dns")
+    return PlexUnavailableError(
+        f"Can't reach Plex at {base_url} ({type(exc).__name__}). "
+        "Check the Plex URL and that the server is running.",
+    )
 
 
 def configure_plex_identity(product: str, device_name: str, identifier: str) -> dict:
@@ -109,6 +191,14 @@ class PlexItem:
 
 
 class PlexClient:
+    """Plex server wrapper that connects lazily and reconnects on demand.
+
+    Nothing touches the network in ``__init__``: the first call that needs the
+    server connects, and a failed connect is retried on a later call. So an
+    unreachable Plex (wrong URL, DNS, server down) never prevents the app from
+    starting — the UI stays up to fix it and the jobs recover on their own.
+    """
+
     def __init__(
         self,
         base_url: str,
@@ -120,9 +210,12 @@ class PlexClient:
         configure_plex_identity(
             product="Whitelistarr", device_name=device_name, identifier=client_id
         )
-        from plexapi.server import PlexServer
-
-        self._server = PlexServer(base_url, token)
+        self._base_url = base_url
+        self._token = token
+        self._server: Any = None
+        self._connect_lock = threading.Lock()
+        self._last_error: PlexUnavailableError | None = None
+        self._last_error_at = 0.0
         self._section_filter = set(sections or [])
         # Lazily-built {media_type: {guid_key: video}} index, used only as the
         # legacy/cross-id fallback in find_item_by_keys (getGuid can't resolve
@@ -133,9 +226,50 @@ class PlexClient:
         self._resolve_index_at = 0.0
         self._resolve_ttl = 300.0
 
+    def connect(self) -> Any:
+        """Return the connected ``PlexServer``, connecting first if needed.
+
+        Raises ``PlexUnavailableError`` (with a readable message) when Plex can't
+        be reached; the next call after a short back-off tries again.
+        """
+        server = self._server
+        if server is not None:
+            return server
+        with self._connect_lock:
+            if self._server is not None:  # another thread connected meanwhile
+                return self._server
+            if (
+                self._last_error is not None
+                and time.monotonic() - self._last_error_at < _CONNECT_RETRY_SECONDS
+            ):
+                # Fresh traceback each time so a long outage can't grow it unbounded.
+                raise self._last_error.with_traceback(None)
+            from plexapi.server import PlexServer
+
+            try:
+                server = PlexServer(self._base_url, self._token)
+            except Exception as exc:  # noqa: BLE001 - every failure becomes a clear error
+                error = describe_connect_error(self._base_url, exc)
+                log.debug("Plex connect failed", exc_info=True)
+                self._last_error, self._last_error_at = error, time.monotonic()
+                raise error from exc
+            log.info(
+                "Connected to Plex server %r at %s",
+                getattr(server, "friendlyName", "?"),
+                self._base_url,
+            )
+            self._last_error = None
+            self._server = server
+            return server
+
     def check(self) -> dict:
         try:
-            name = self._server.friendlyName
+            name = self.connect().friendlyName
+        except PlexUnavailableError as exc:
+            log.warning("Plex connection probe failed: %s", exc)
+            # Only the fixed reason code reaches the UI, never the message/URL.
+            detail = "DNS lookup failed" if exc.reason == "dns" else exc.reason
+            return {"ok": False, "detail": detail}
         except Exception:  # noqa: BLE001 - generic detail; full error logged, never sent to UI
             log.warning("Plex connection probe failed", exc_info=True)
             return {"ok": False, "detail": "unreachable"}
@@ -148,14 +282,14 @@ class PlexClient:
         pickable libraries so the user can choose which ones to include.
         """
         libs = []
-        for section in self._server.library.sections():
+        for section in self.connect().library.sections():
             if section.type in _SECTION_TYPE:
                 libs.append({"title": section.title, "type": section.type})
         return libs
 
     def _sections(self) -> list[object]:
         result = []
-        for section in self._server.library.sections():
+        for section in self.connect().library.sections():
             if section.type not in _SECTION_TYPE:
                 continue
             if self._section_filter and section.title not in self._section_filter:
@@ -197,7 +331,7 @@ class PlexClient:
         from plexapi.exceptions import NotFound
 
         try:
-            item = self._server.fetchItem(int(rating_key))
+            item = self.connect().fetchItem(int(rating_key))
         except (NotFound, ValueError, TypeError):
             return None
 
