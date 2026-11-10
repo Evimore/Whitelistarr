@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request, Response
 from starlette.concurrency import run_in_threadpool
 
 from app import __version__
+from app.clients.plex import PlexUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -135,12 +136,16 @@ def create_app(
         log.info(
             "Webhook: %s tmdb=%s tvdb=%s", event.media_type, event.tmdb_id, event.tvdb_id
         )
-        await run_in_threadpool(
-            sync.sync_by_ids,
-            event.media_type,
-            tmdb_id=event.tmdb_id,
-            tvdb_id=event.tvdb_id,
-        )
+        try:
+            await run_in_threadpool(
+                sync.sync_by_ids,
+                event.media_type,
+                tmdb_id=event.tmdb_id,
+                tvdb_id=event.tvdb_id,
+            )
+        except PlexUnavailableError as exc:
+            log.warning("Seerr webhook not applied: %s", exc)
+            return Response(status_code=503)
         return Response(status_code=200)
 
     @app.post(plex_webhook_path)
@@ -171,7 +176,11 @@ def create_app(
             return Response(status_code=200)
 
         log.info("Plex webhook: library.new ratingKey=%s", event.rating_key)
-        await run_in_threadpool(sync.sync_by_rating_key, event.rating_key)
+        try:
+            await run_in_threadpool(sync.sync_by_rating_key, event.rating_key)
+        except PlexUnavailableError as exc:
+            log.warning("Plex webhook not applied: %s", exc)
+            return Response(status_code=503)
         return Response(status_code=200)
 
     return app

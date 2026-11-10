@@ -319,6 +319,38 @@ patch, `feat!:`/`BREAKING CHANGE:` → major; `docs:`/`chore:`/`test:` → none)
 Pull requests also run tests, lint, CodeQL, a dependency audit, and a Trivy image
 scan. See [`.github/workflows/`](.github/workflows/) for the full pipeline.
 
+## Troubleshooting
+
+### Plex shows "DNS lookup failed" (`*.plex.direct` doesn't resolve)
+
+**Sign in with Plex** gives you Plex's secure URLs, such as
+`https://10-0-0-11.<id>.plex.direct:32400`. These are public DNS names that point
+to a **private** IP. Many DNS resolvers drop answers like that as DNS-rebinding
+protection: routers, Pi-hole, AdGuard Home, Unbound, pfSense/OPNsense. So the name
+may resolve elsewhere but fail inside the container.
+
+When this happens, Whitelistarr keeps running. The UI stays up, the scheduled jobs
+are skipped, and the log shows one line per run:
+
+```
+WARNING app.main: Skipping reactive poll: Can't reach Plex at https://10-0-0-11.….plex.direct:32400:
+the hostname … doesn't resolve. … set the Plex URL to the server's address directly, e.g. http://10.0.0.11:32400.
+```
+
+Fix it with any one of these. Jobs resume on their own once Plex answers.
+
+- **Use the direct address.** Set the Plex URL (**Settings → Plex**, or
+  `PLEX_URL`) to `http://<plex-ip>:32400`. The IP is the first part of the
+  plex.direct name (`10-0-0-11` → `10.0.0.11`). If Plex is on the same Docker
+  network, `http://plex:32400` also works. A plain-HTTP URL needs Plex's
+  **Settings → Network → Secure connections** set to *Preferred* (the default),
+  not *Required*.
+- **Allow `plex.direct` in your DNS rebind protection.** For example, Unbound /
+  pfSense / OPNsense: `private-domain: "plex.direct"`. dnsmasq / OpenWrt:
+  `rebind-domain-ok=/plex.direct/`.
+- **Give the container a different resolver** that doesn't filter, e.g.
+  `dns: ["1.1.1.1"]` on the service in `docker-compose.yml`.
+
 ## Limitations
 
 - Movies and TV shows only.
