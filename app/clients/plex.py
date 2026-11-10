@@ -16,7 +16,11 @@ import time
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+from requests.adapters import HTTPAdapter
+from requests.utils import select_proxy
 
 from app.core.matching import extract_guids, guid_key, parse_legacy_guid
 
@@ -61,17 +65,69 @@ def _is_dns_failure(exc: BaseException) -> bool:
     return False
 
 
-def plex_direct_fallback_url(base_url: str) -> str | None:
-    """For a ``*.plex.direct`` URL, the plain ``http://<ip>:<port>`` it points at."""
-    parts = urlsplit(base_url)
-    match = _PLEX_DIRECT_IPV4.match((parts.hostname or "").lower())
+def plex_direct_ip(base_url: str) -> str | None:
+    """The IPv4 address a ``*.plex.direct`` URL's hostname encodes, else None."""
+    match = _PLEX_DIRECT_IPV4.match(urlsplit(base_url).hostname or "")
     if not match:
         return None
     try:
-        ip = ipaddress.IPv4Address(".".join(match.groups()))
+        return str(ipaddress.IPv4Address(".".join(match.groups())))
     except ValueError:
         return None
-    return f"http://{ip}:{parts.port or 32400}"
+
+
+class _PlexDirectAdapter(HTTPAdapter):
+    """Send requests for one ``*.plex.direct`` host straight to the IP in its name.
+
+    A plex.direct name is a fixed encoding of the address it resolves to
+    (``10-0-0-11.<id>.plex.direct`` is always 10.0.0.11), so skipping DNS doesn't
+    change where a request goes. It only keeps resolvers with DNS-rebinding
+    protection (routers, Pi-hole, AdGuard Home, Unbound) from breaking the
+    connection: they drop public names that answer with a private IP.
+
+    TLS is unchanged. SNI, the Host header and certificate verification all still
+    use the plex.direct name. A request that goes through a configured proxy is
+    left alone, because the proxy resolves the name.
+    """
+
+    def __init__(self, hostname: str, ip: str) -> None:
+        # Set before super().__init__, which calls init_poolmanager.
+        self._hostname = hostname
+        self._ip = ip
+        super().__init__()
+
+    def init_poolmanager(self, *args: Any, **pool_kwargs: Any) -> None:
+        pool_kwargs.update(server_hostname=self._hostname, assert_hostname=self._hostname)
+        super().init_poolmanager(*args, **pool_kwargs)
+
+    def send(self, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:
+        url = request.url or ""
+        parts = urlsplit(url)
+        if parts.hostname != self._hostname or select_proxy(url, kwargs.get("proxies")):
+            return super().send(request, **kwargs)
+        pinned = request.copy()
+        port = f":{parts.port}" if parts.port else ""
+        pinned.url = urlunsplit(parts._replace(netloc=f"{self._ip}{port}"))
+        pinned.headers["Host"] = parts.netloc
+        response = super().send(pinned, **kwargs)
+        # Hand back the URL the caller asked for, so a redirect resolves against the
+        # plex.direct name and comes back through this adapter.
+        response.url, response.request = url, request
+        return response
+
+
+def plex_session(base_url: str) -> requests.Session | None:
+    """A requests session that reaches a ``*.plex.direct`` URL without DNS.
+
+    None for any other URL, so plexapi uses its default session.
+    """
+    ip = plex_direct_ip(base_url)
+    if ip is None:
+        return None
+    parts = urlsplit(base_url)
+    session = requests.Session()
+    session.mount(f"{parts.scheme}://{parts.netloc}", _PlexDirectAdapter(parts.hostname, ip))
+    return session
 
 
 def describe_connect_error(base_url: str, exc: BaseException) -> PlexUnavailableError:
@@ -88,12 +144,12 @@ def describe_connect_error(base_url: str, exc: BaseException) -> PlexUnavailable
         host = urlsplit(base_url).hostname or base_url
         message = f"Can't reach Plex at {base_url}: the hostname {host} doesn't resolve."
         if host.lower().endswith(".plex.direct"):
-            fallback = plex_direct_fallback_url(base_url)
+            # IPv4 plex.direct names are connected to without DNS (plex_session), so
+            # this is a name that encodes no IPv4 address, e.g. an IPv6 one.
             message += (
                 " *.plex.direct names are commonly blocked by DNS-rebinding protection"
                 " (router, Pi-hole, AdGuard Home, Unbound). Allow plex.direct there, or set"
-                " the Plex URL to the server's address directly"
-                + (f", e.g. {fallback}." if fallback else ".")
+                " the Plex URL to the server's address directly, e.g. http://<plex-ip>:32400."
             )
         return PlexUnavailableError(message, reason="dns")
     return PlexUnavailableError(
@@ -246,17 +302,19 @@ class PlexClient:
                 raise self._last_error.with_traceback(None)
             from plexapi.server import PlexServer
 
+            session = plex_session(self._base_url)
             try:
-                server = PlexServer(self._base_url, self._token)
+                server = PlexServer(self._base_url, self._token, session=session)
             except Exception as exc:  # noqa: BLE001 - every failure becomes a clear error
                 error = describe_connect_error(self._base_url, exc)
                 log.debug("Plex connect failed", exc_info=True)
                 self._last_error, self._last_error_at = error, time.monotonic()
                 raise error from exc
             log.info(
-                "Connected to Plex server %r at %s",
+                "Connected to Plex server %r at %s%s",
                 getattr(server, "friendlyName", "?"),
                 self._base_url,
+                f" (via {plex_direct_ip(self._base_url)}, no DNS lookup)" if session else "",
             )
             self._last_error = None
             self._server = server

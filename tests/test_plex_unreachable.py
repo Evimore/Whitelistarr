@@ -20,7 +20,6 @@ from app.clients.plex import (
     PlexClient,
     PlexUnavailableError,
     describe_connect_error,
-    plex_direct_fallback_url,
 )
 from app.config import load_settings
 from app.webhook import create_app
@@ -73,7 +72,7 @@ def test_connect_raises_readable_dns_error(plex_server):
     message = str(info.value)
     assert "doesn't resolve" in message
     assert "DNS-rebinding" in message
-    assert "http://10.0.0.11:32400" in message  # concrete fix, derived from the name
+    assert "set the Plex URL to the server's address directly" in message
 
 
 def test_connect_backs_off_then_retries_and_recovers(plex_server, monkeypatch):
@@ -118,20 +117,6 @@ def test_other_failures_are_generic():
     assert err.reason == "unreachable"
     assert "ConnectTimeout" in str(err)
     assert "plex.direct" not in str(err)
-
-
-@pytest.mark.parametrize(
-    ("url", "expected"),
-    [
-        (PLEX_DIRECT, "http://10.0.0.11:32400"),
-        ("https://192-168-1-20.abc.plex.direct:32401", "http://192.168.1.20:32401"),
-        ("https://999-0-0-1.abc.plex.direct:32400", None),  # not a valid IPv4
-        ("http://plex:32400", None),
-        ("https://my.plex.example:32400", None),
-    ],
-)
-def test_plex_direct_fallback_url(url, expected):
-    assert plex_direct_fallback_url(url) == expected
 
 
 # --- wiring -------------------------------------------------------------------
