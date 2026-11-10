@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,29 @@ from app.runtime import Runtime
 from app.scheduler import Scheduler, build_scheduler
 
 log = logging.getLogger(__name__)
+
+# Credentials that travel in a query string, e.g. Tautulli's ``?apikey=``, which
+# httpx prints in its "HTTP Request: GET <url>" lines.
+_SECRET_QUERY_PARAM = re.compile(
+    r"([?&](?:apikey|api_key|x-plex-token|token)=)[^&#\s\"']+", re.IGNORECASE
+)
+
+
+class RedactSecretsFilter(logging.Filter):
+    """Mask credential query parameters before a line reaches any log output."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - leave a broken record to the handler
+            return True
+        redacted = _SECRET_QUERY_PARAM.sub(r"\1<redacted>", message)
+        if redacted != message:
+            record.msg, record.args = redacted, None
+        return True
+
+
+_REDACT_SECRETS = RedactSecretsFilter()
 
 
 def setup_logging(level: str, log_file: str = "", log_file_lines: int = 10000) -> None:
@@ -37,6 +61,10 @@ def setup_logging(level: str, log_file: str = "", log_file_lines: int = 10000) -
                 encoding="utf-8",
             )
         )
+    # On the handlers, not a logger, so it covers every logger (httpx included)
+    # and every output: console, the UI's Logs tab and the log file.
+    for handler in handlers:
+        handler.addFilter(_REDACT_SECRETS)
 
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
