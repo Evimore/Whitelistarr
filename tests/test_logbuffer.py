@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from app.logbuffer import LogBuffer
 
 
@@ -129,3 +131,47 @@ def test_as_logging_handler_captures_through_logger():
     finally:
         logger.removeHandler(buf.handler())
     assert buf.records()[-1]["message"] == "hello world"
+
+
+def test_setup_logging_redacts_api_keys_in_urls(tmp_path):
+    """httpx logs full request URLs, and Tautulli's API key is a query parameter."""
+    from app.logbuffer import LOG_BUFFER
+    from app.main import setup_logging
+
+    f = tmp_path / "whitelistarr.log"
+    try:
+        setup_logging("info", log_file=str(f))
+        logging.getLogger("httpx").info(
+            'HTTP Request: %s %s "%s %d %s"',
+            "GET",
+            "http://tautulli:8181/api/v2?apikey=2b53e377f2834eb1&cmd=get_server_info",
+            "HTTP/1.1",
+            200,
+            "OK",
+        )
+        expected = (
+            'HTTP Request: GET http://tautulli:8181/api/v2?apikey=<redacted>'
+            '&cmd=get_server_info "HTTP/1.1 200 OK"'
+        )
+        assert LOG_BUFFER.records()[-1]["message"] == expected
+        assert "2b53e377f2834eb1" not in f.read_text(encoding="utf-8")
+    finally:
+        setup_logging("info")  # reset root handlers (drop the tmp file handler)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("GET /x?X-Plex-Token=abc&a=1", "GET /x?X-Plex-Token=<redacted>&a=1"),
+        ("GET /x?a=1&api_key=abc", "GET /x?a=1&api_key=<redacted>"),
+        ("GET /x?token=abc#frag", "GET /x?token=<redacted>#frag"),
+        ("GET /x?cmd=get_history&length=100", "GET /x?cmd=get_history&length=100"),
+        ("my apikey=abc is not a query param", "my apikey=abc is not a query param"),
+    ],
+)
+def test_redact_secrets_filter(message, expected):
+    from app.main import RedactSecretsFilter
+
+    record = _record(logging.INFO, message)
+    assert RedactSecretsFilter().filter(record) is True
+    assert record.getMessage() == expected
