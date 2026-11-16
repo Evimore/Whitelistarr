@@ -144,6 +144,16 @@ class FakeSection:
 class FakeServer:
     def __init__(self, sections):
         self.library = type("Lib", (), {"sections": lambda self: sections})()
+        self._sections = sections
+        self.fetched = []  # rating keys fetched by key, to assert fresh reads
+
+    def fetchItem(self, rating_key):
+        self.fetched.append(rating_key)
+        for section in self._sections:
+            for video in section._videos:
+                if video.ratingKey == rating_key:
+                    return video
+        raise NotFound(rating_key)
 
 
 def _client_with(sections):
@@ -232,6 +242,34 @@ def test_find_item_by_keys_reuses_cached_index_across_lookups():
     assert client.find_item_by_keys("show", {"tvdb:100"}) is not None
     assert client.find_item_by_keys("show", {"tvdb:100"}) is not None
     assert section.all_calls == 1  # second lookup hit the cached index
+
+
+def test_find_item_by_keys_fallback_fetches_fresh_item_by_rating_key():
+    # The cached index must not hand out the scanned object: plexapi never
+    # refreshes its labels after an edit, so it would go stale.
+    scanned = FakeVideo("Ted Lasso", [], ["Favorite"], rating_key=7,
+                        guid="com.plexapp.agents.thetvdb://100")
+    section = FakeSection("show", "TV", [scanned])
+    client = _client_with([section])
+    client.find_item_by_keys("show", {"tvdb:100"})  # builds the index
+
+    fresh = FakeVideo("Ted Lasso", [], ["Favorite", "Watchlist"], rating_key=7,
+                      guid="com.plexapp.agents.thetvdb://100")
+    section._videos = [fresh]  # Plex now has a label added since the scan
+    item = client.find_item_by_keys("show", {"tvdb:100"})
+
+    assert item.labels() == {"Favorite", "Watchlist"}
+    assert client._server.fetched == [7, 7]
+    assert section.all_calls == 1  # still one library scan per TTL window
+
+
+def test_find_item_by_keys_skips_item_deleted_since_index_built():
+    v = FakeVideo("Ted Lasso", [], [], rating_key=7, guid="com.plexapp.agents.thetvdb://100")
+    section = FakeSection("show", "TV", [v])
+    client = _client_with([section])
+    client.find_item_by_keys("show", {"tvdb:100"})  # builds the index
+    section._videos = []  # removed from Plex
+    assert client.find_item_by_keys("show", {"tvdb:100"}) is None
 
 
 def test_find_item_by_keys_returns_none_when_absent():

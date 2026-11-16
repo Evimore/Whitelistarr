@@ -273,12 +273,13 @@ class PlexClient:
         self._last_error: PlexUnavailableError | None = None
         self._last_error_at = 0.0
         self._section_filter = set(sections or [])
-        # Lazily-built {media_type: {guid_key: video}} index, used only as the
+        # Lazily-built {media_type: {guid_key: ratingKey}} index, used only as the
         # legacy/cross-id fallback in find_item_by_keys (getGuid can't resolve
         # legacy-agent items). Cached so a batch of lookups — e.g. one watch
         # scan over every Overseerr request — costs a single library scan, not
-        # one per lookup. The sweep is the backstop, so a coarse TTL is fine.
-        self._resolve_index: dict[str, dict[str, object]] | None = None
+        # one per lookup. It holds rating keys, not plexapi objects: a hit is
+        # fetched fresh, so its labels are current when we edit them.
+        self._resolve_index: dict[str, dict[str, str]] | None = None
         self._resolve_index_at = 0.0
         self._resolve_ttl = 300.0
 
@@ -419,10 +420,17 @@ class PlexClient:
 
         Fast path: plexapi's ``getGuid`` for the tmdb/tvdb keys — resolved
         server-side for the modern Plex Movie/TV agents. Fallback: a cached
-        ``guid_key -> video`` index, which is the only way to resolve
+        ``guid_key -> ratingKey`` index, which is the only way to resolve
         legacy-agent items (no modern ``Guid[]`` for getGuid to match) and
         cross-id requests (e.g. a tmdb request whose legacy Plex item carries
         only an imdb guid — callers pass the sibling ids so this still matches).
+
+        A fallback hit is re-fetched by ratingKey rather than served from the
+        cache. plexapi never updates an object's labels after an edit, and
+        ``addLabel`` sends the object's labels plus the new one as the complete
+        list. A cached object would therefore hide labels we added (so a later
+        removal is skipped) and drop labels added in Plex since (manual ones
+        included) the next time we add one.
         """
         from plexapi.exceptions import NotFound
 
@@ -446,14 +454,16 @@ class PlexClient:
 
         # Fallback: consult the cached index (built once per TTL window).
         index = self._resolution_index(media_type)
-        for key in keys:
-            video = index.get(key)
-            if video is not None:
-                return PlexItem(video, media_type)
+        for rating_key in dict.fromkeys(index[key] for key in keys if key in index):
+            try:
+                video = self.connect().fetchItem(int(rating_key))
+            except NotFound:
+                continue  # deleted since the index was built
+            return PlexItem(video, media_type)
         return None
 
-    def _resolution_index(self, media_type: str) -> dict[str, object]:
-        """Cached ``{guid_key: video}`` for one media type, for legacy fallback.
+    def _resolution_index(self, media_type: str) -> dict[str, str]:
+        """Cached ``{guid_key: ratingKey}`` for one media type, for legacy fallback.
 
         Rebuilt when older than the TTL. Scans each matching section once and
         keys every video by all of its guid_keys (which include legacy-agent
@@ -464,12 +474,13 @@ class PlexClient:
             self._resolve_index = {}
             self._resolve_index_at = now
         if media_type not in self._resolve_index:
-            index: dict[str, object] = {}
+            index: dict[str, str] = {}
             for section in self._sections():
                 if _SECTION_TYPE[section.type] != media_type:
                     continue
                 for video in section.all():
-                    for key in PlexItem(video, media_type).guid_keys():
-                        index.setdefault(key, video)
+                    item = PlexItem(video, media_type)
+                    for key in item.guid_keys():
+                        index.setdefault(key, item.rating_key)
             self._resolve_index[media_type] = index
         return self._resolve_index[media_type]
