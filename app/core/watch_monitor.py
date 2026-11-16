@@ -57,6 +57,7 @@ class WatchMonitor:
         unwatched_after_days: int,
         now_fn: Callable[[], datetime] = datetime.now,
         resolve_item: Callable[..., Any] | None = None,
+        dry_run: bool = False,
     ) -> None:
         self._overseerr = overseerr
         self._tautulli = tautulli
@@ -73,6 +74,7 @@ class WatchMonitor:
         # *arr id bridge (Overseerr gives tmdb/tvdb; a legacy item may be indexed
         # under imdb only).
         self._resolve_item = resolve_item or plex.find_item
+        self._dry_run = dry_run
 
     def scan(self) -> dict[str, int]:
         processed = 0
@@ -96,14 +98,11 @@ class WatchMonitor:
 
         if "watched" in self._events:
             if max_watched_percent(rows) >= self._watched_percent:
-                key = f"{item.rating_key}:watched"
-                if not self._state.already_notified(key):
-                    self._notifier.notify(
-                        "Requester finished watching",
-                        f"{who} finished watching {item.title}",
-                    )
-                    self._state.mark_notified(key)
-                    count += 1
+                count += self._notify_once(
+                    f"{item.rating_key}:watched",
+                    "Requester finished watching",
+                    f"{who} finished watching {item.title}",
+                )
 
         if "stale" in self._events:
             stale = is_stale(
@@ -114,13 +113,27 @@ class WatchMonitor:
                 self._unwatched_after_days,
             )
             if stale:
-                key = f"{item.rating_key}:stale"
-                if not self._state.already_notified(key):
-                    self._notifier.notify(
-                        "Stale request",
-                        f"{item.title} (requested by {who}) is still unwatched",
-                    )
-                    self._state.mark_notified(key)
-                    count += 1
+                count += self._notify_once(
+                    f"{item.rating_key}:stale",
+                    "Stale request",
+                    f"{item.title} (requested by {who}) is still unwatched",
+                )
 
         return count
+
+    def _notify_once(self, key: str, title: str, body: str) -> int:
+        """Send a notification unless ``key`` was already sent. Returns 1 if sent.
+
+        The key is recorded only after a real, successful send, so the event is
+        retried on the next scan otherwise. Apprise reports a failed delivery by
+        returning False, not by raising. In DRY_RUN the notifier only logs, and
+        nothing is recorded, so the event still notifies once DRY_RUN is off.
+        """
+        if self._state.already_notified(key):
+            return 0
+        if not self._notifier.notify(title, body):
+            log.warning("Notification %r for %s was not delivered; retrying next scan", title, key)
+            return 0
+        if not self._dry_run:
+            self._state.mark_notified(key)
+        return 1

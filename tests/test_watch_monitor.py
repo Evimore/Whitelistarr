@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from app.clients.notify import Notifier
 from app.clients.seerr import RequestInfo
 from app.core.watch_monitor import (
     WatchMonitor,
@@ -79,12 +80,13 @@ class FakeTautulli:
 
 
 class FakeNotifier:
-    def __init__(self):
+    def __init__(self, results=()):
         self.sent = []
+        self._results = list(results)  # per-call return values; True once exhausted
 
     def notify(self, title, body):
         self.sent.append((title, body))
-        return True
+        return self._results.pop(0) if self._results else True
 
 
 def _request():
@@ -94,7 +96,9 @@ def _request():
     )
 
 
-def _monitor(plex, tautulli, notifier, state, events=("watched", "stale"), resolve_item=None):
+def _monitor(
+    plex, tautulli, notifier, state, events=("watched", "stale"), resolve_item=None, dry_run=False
+):
     return WatchMonitor(
         overseerr=type("O", (), {"iter_requests": lambda self: [_request()]})(),
         tautulli=tautulli,
@@ -107,6 +111,7 @@ def _monitor(plex, tautulli, notifier, state, events=("watched", "stale"), resol
         unwatched_after_days=90,
         now_fn=lambda: NOW,
         resolve_item=resolve_item,
+        dry_run=dry_run,
     )
 
 
@@ -132,6 +137,49 @@ def test_watched_notification_deduped():
     mon.scan()
     mon.scan()
     assert len(notifier.sent) == 1
+
+
+def test_failed_delivery_is_retried_on_next_scan():
+    # Apprise returns False (it doesn't raise) when a send fails, e.g. Discord is down.
+    item = FakePlexItem("Dune", "111", added_at=datetime(2026, 6, 1))
+    tautulli = FakeTautulli([{"percent_complete": 95, "date": _epoch(datetime(2026, 6, 10))}])
+    notifier = FakeNotifier(results=[False])
+    mon = _monitor(FakePlex(item), tautulli, notifier, StateStore(":memory:"), events=("watched",))
+
+    assert mon.scan()["notified"] == 0
+    assert mon.scan()["notified"] == 1
+    assert mon.scan()["notified"] == 0  # delivered once -> deduped from then on
+    assert len(notifier.sent) == 2
+
+
+class FakeApprise:
+    def __init__(self):
+        self.sent = []
+
+    def __len__(self):
+        return 1
+
+    def notify(self, title, body, **kwargs):
+        self.sent.append(title)
+        return True
+
+
+def test_dry_run_does_not_use_up_the_notification():
+    # The README suggests a DRY_RUN first run. Events seen during it must still
+    # notify once DRY_RUN is turned off.
+    item = FakePlexItem("Dune", "111", added_at=datetime(2026, 6, 1))
+    tautulli = FakeTautulli([{"percent_complete": 95, "date": _epoch(datetime(2026, 6, 10))}])
+    state = StateStore(":memory:")
+    dry_apprise, live_apprise = FakeApprise(), FakeApprise()
+
+    dry = Notifier([], dry_run=True, apprise_obj=dry_apprise)
+    summary = _monitor(FakePlex(item), tautulli, dry, state, events=("watched",), dry_run=True).scan()
+    assert summary["notified"] == 1  # reported as "would notify"
+    assert dry_apprise.sent == []    # but nothing actually sent
+
+    live = Notifier([], apprise_obj=live_apprise)
+    _monitor(FakePlex(item), tautulli, live, state, events=("watched",)).scan()
+    assert live_apprise.sent == ["Requester finished watching"]
 
 
 def test_notifies_stale_when_old_and_unwatched():
