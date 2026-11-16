@@ -321,6 +321,29 @@ scan. See [`.github/workflows/`](.github/workflows/) for the full pipeline.
 
 ## Troubleshooting
 
+### Labels don't show up in Plex
+
+If the log shows a line like this (with no `[DRY_RUN]` prefix), the label was
+written to Plex:
+
+```
+INFO app.core.labeler Dune [tmdb:438631]: +['kids-allowed'] -
+```
+
+Whitelistarr writes Plex **labels**, not collections, because labels are what a
+share restriction filters on (see
+[Restricting a shared user to the label](#restricting-a-shared-user-to-the-label)).
+Plex doesn't show labels on the item's page. To see them:
+
+- Open the item's **Edit** dialog. Labels are listed in the **Tags** section.
+- Or filter the library by **Label**.
+
+Plex capitalizes the first letter, so `kids-allowed` shows as `Kids-allowed`.
+
+**Want a collection too?** Filter the library by the label, then save that
+filter as a **Smart Collection**. It stays up to date as Whitelistarr labels and
+unlabels items, and the label keeps controlling what shared users can see.
+
 ### `*.plex.direct` URLs and DNS-rebinding protection
 
 **Sign in with Plex** gives you Plex's secure URLs, such as
