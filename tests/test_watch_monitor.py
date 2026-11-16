@@ -74,8 +74,10 @@ class FakePlex:
 class FakeTautulli:
     def __init__(self, rows):
         self._rows = rows
+        self.calls = []
 
-    def get_history(self, rating_key=None, user=None, length=100):
+    def get_history(self, rating_key=None, user=None, length=100, grandparent_rating_key=None):
+        self.calls.append({"rating_key": rating_key, "grandparent_rating_key": grandparent_rating_key})
         return self._rows
 
 
@@ -96,11 +98,20 @@ def _request():
     )
 
 
+def _tv_request():
+    return RequestInfo(
+        media_type="tv", tmdb_id=None, tvdb_id=353546,
+        requester="family", requester_name="Family", rating_key=None,
+    )
+
+
 def _monitor(
-    plex, tautulli, notifier, state, events=("watched", "stale"), resolve_item=None, dry_run=False
+    plex, tautulli, notifier, state, events=("watched", "stale"), resolve_item=None,
+    dry_run=False, request=None,
 ):
+    req = request or _request()
     return WatchMonitor(
-        overseerr=type("O", (), {"iter_requests": lambda self: [_request()]})(),
+        overseerr=type("O", (), {"iter_requests": lambda self: [req]})(),
         tautulli=tautulli,
         plex=plex,
         notifier=notifier,
@@ -223,3 +234,60 @@ def test_injected_resolver_is_used_instead_of_plex_find_item():
     _monitor(ExplodingPlex(), tautulli, notifier, StateStore(":memory:"), resolve_item=resolver).scan()
     assert calls == [("movie", 603, None)]
     assert len(notifier.sent) == 1
+
+
+# --- TV requests ------------------------------------------------------------
+
+def _show_resolver(item, calls):
+    def resolver(media_type, tmdb_id=None, tvdb_id=None):
+        calls.append(media_type)
+        return item if media_type == "show" else None  # Plex sections are "movie"/"show"
+
+    return resolver
+
+
+def test_tv_request_resolves_as_a_plex_show():
+    # Seerr calls TV "tv"; Plex sections are "show". Passing "tv" through never matched.
+    item = FakePlexItem("Bluey", "500", added_at=datetime(2025, 1, 1))
+    calls = []
+    mon = _monitor(None, FakeTautulli([]), FakeNotifier(), StateStore(":memory:"),
+                   events=("stale",), resolve_item=_show_resolver(item, calls),
+                   request=_tv_request())
+    assert mon.scan()["notified"] == 1
+    assert calls == ["show"]
+
+
+def test_tv_history_is_looked_up_by_the_show_as_grandparent():
+    item = FakePlexItem("Bluey", "500", added_at=datetime(2025, 1, 1))
+    tautulli = FakeTautulli([])
+    _monitor(None, tautulli, FakeNotifier(), StateStore(":memory:"), events=("stale",),
+             resolve_item=_show_resolver(item, []), request=_tv_request()).scan()
+    assert tautulli.calls == [{"rating_key": None, "grandparent_rating_key": "500"}]
+
+
+def test_tv_show_watched_recently_is_not_stale():
+    item = FakePlexItem("Bluey", "500", added_at=datetime(2025, 1, 1))
+    episode_play = {"percent_complete": 100, "date": _epoch(datetime(2026, 6, 1))}
+    notifier = FakeNotifier()
+    _monitor(None, FakeTautulli([episode_play]), notifier, StateStore(":memory:"),
+             events=("stale",), resolve_item=_show_resolver(item, []),
+             request=_tv_request()).scan()
+    assert notifier.sent == []
+
+
+def test_watched_event_is_movies_only():
+    # One episode past the threshold doesn't mean the requester finished the show.
+    item = FakePlexItem("Bluey", "500", added_at=datetime(2026, 6, 1))
+    episode_play = {"percent_complete": 100, "date": _epoch(datetime(2026, 6, 10))}
+    notifier = FakeNotifier()
+    _monitor(None, FakeTautulli([episode_play]), notifier, StateStore(":memory:"),
+             events=("watched",), resolve_item=_show_resolver(item, []),
+             request=_tv_request()).scan()
+    assert notifier.sent == []
+
+
+def test_movie_history_is_still_looked_up_by_rating_key():
+    item = FakePlexItem("Dune", "111", added_at=datetime(2026, 6, 1))
+    tautulli = FakeTautulli([])
+    _monitor(FakePlex(item), tautulli, FakeNotifier(), StateStore(":memory:")).scan()
+    assert tautulli.calls == [{"rating_key": "111", "grandparent_rating_key": None}]

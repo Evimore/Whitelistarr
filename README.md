@@ -195,10 +195,11 @@ Choose which events notify via `NOTIFY_ON`:
   messages (**Label Added** / **Label Removed**), grouped by media type, listing
   every affected item. Deduplicated per item and label. Requires only
   `APPRISE_URLS`.
-- **`watched`** — the requester watched an item past `WATCHED_PERCENT` (default
-  85%). Requires Tautulli and `FEATURE_NOTIFY=true`.
-- **`stale`** — an item is older than `STALE_AFTER_DAYS` and unwatched for
-  `UNWATCHED_AFTER_DAYS`. Requires Tautulli and `FEATURE_NOTIFY=true`.
+- **`watched`** — the requester watched a movie past `WATCHED_PERCENT` (default
+  85%). Movies only. Requires Tautulli and `FEATURE_NOTIFY=true`.
+- **`stale`** — a movie or show is older than `STALE_AFTER_DAYS` and the
+  requester hasn't watched it for `UNWATCHED_AFTER_DAYS`. For a show, watching any
+  episode counts. Requires Tautulli and `FEATURE_NOTIFY=true`.
 
 With `DRY_RUN=true`, notifications are logged but not sent. To confirm your
 channels work, use the **Send test notification** button in the web UI's Actions
@@ -381,7 +382,8 @@ Fix it with any one of these. Jobs resume on their own once Plex answers.
 ## Limitations
 
 - Movies and TV shows only.
-- TV "fully watched" is approximate (a percent threshold); movies are exact.
+- The `watched` notification covers movies only. TV shows get `stale`
+  notifications.
 - GUID matching depends on correct Plex agent metadata; unmatched items are logged
   during the sweep.
 - Seerr → Radarr/Sonarr requester tagging must already be enabled.

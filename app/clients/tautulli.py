@@ -36,10 +36,17 @@ class TautulliClient:
         rating_key: str | int | None = None,
         user: str | None = None,
         length: int = 100,
+        grandparent_rating_key: str | int | None = None,
     ) -> list[dict[str, Any]]:
+        """Watch history, newest first.
+
+        ``rating_key`` matches the played item exactly, so for a TV show pass the
+        show's key as ``grandparent_rating_key``: its plays are episodes.
+        """
         data = self._command(
             "get_history",
             rating_key=rating_key,
+            grandparent_rating_key=grandparent_rating_key,
             user=user,
             length=length,
         )

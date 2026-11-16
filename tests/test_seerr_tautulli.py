@@ -89,3 +89,16 @@ def test_tautulli_sends_apikey_and_cmd_params():
     assert req.url.params["apikey"] == "secret"
     assert req.url.params["cmd"] == "get_history"
     assert req.url.params["rating_key"] == "5"
+
+
+@respx.mock
+def test_tautulli_get_history_by_show_sends_grandparent_rating_key():
+    route = respx.get(f"{TAUTULLI}/api/v2").mock(
+        return_value=httpx.Response(
+            200, json={"response": {"result": "success", "data": {"data": []}}}
+        )
+    )
+    TautulliClient(TAUTULLI, "secret").get_history(grandparent_rating_key="500", user="family")
+    params = route.calls.last.request.url.params
+    assert params["grandparent_rating_key"] == "500"
+    assert "rating_key" not in params

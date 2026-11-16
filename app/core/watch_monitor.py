@@ -14,6 +14,9 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Seerr media type -> the Plex-side media type the resolver matches sections on.
+_PLEX_MEDIA_TYPE = {"movie": "movie", "tv": "show"}
+
 
 def max_watched_percent(rows: list[dict[str, Any]]) -> int:
     return max((int(r.get("percent_complete") or 0) for r in rows), default=0)
@@ -89,14 +92,26 @@ class WatchMonitor:
         return {"processed": processed, "notified": notified}
 
     def _process(self, req: Any) -> int:
-        item = self._resolve_item(req.media_type, tmdb_id=req.tmdb_id, tvdb_id=req.tvdb_id)
+        media_type = _PLEX_MEDIA_TYPE.get(req.media_type)
+        if media_type is None:
+            return 0
+        item = self._resolve_item(media_type, tmdb_id=req.tmdb_id, tvdb_id=req.tvdb_id)
         if item is None:
             return 0
-        rows = self._tautulli.get_history(rating_key=item.rating_key, user=req.requester)
+        is_show = media_type == "show"
+        if is_show:
+            # Tautulli's rating_key matches the played item, and a show's plays
+            # are its episodes, which carry the show's key as their grandparent.
+            rows = self._tautulli.get_history(
+                grandparent_rating_key=item.rating_key, user=req.requester
+            )
+        else:
+            rows = self._tautulli.get_history(rating_key=item.rating_key, user=req.requester)
         who = req.requester_name or req.requester or "Someone"
         count = 0
 
-        if "watched" in self._events:
+        # Movies only: one episode past the threshold isn't "finished watching" a show.
+        if "watched" in self._events and not is_show:
             if max_watched_percent(rows) >= self._watched_percent:
                 count += self._notify_once(
                     f"{item.rating_key}:watched",
