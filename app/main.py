@@ -24,21 +24,66 @@ _SECRET_QUERY_PARAM = re.compile(
 )
 
 
+def _redact(text: str) -> str:
+    return _SECRET_QUERY_PARAM.sub(r"\1<redacted>", text)
+
+
 class RedactSecretsFilter(logging.Filter):
-    """Mask credential query parameters before a line reaches any log output."""
+    """Mask credential query parameters before a line reaches any log output.
+
+    Covers the message and any attached traceback: httpx's HTTPStatusError puts
+    the full request URL, query string included, in its text.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             message = record.getMessage()
         except Exception:  # noqa: BLE001 - leave a broken record to the handler
             return True
-        redacted = _SECRET_QUERY_PARAM.sub(r"\1<redacted>", message)
-        if redacted != message:
-            record.msg, record.args = redacted, None
+        if _redact(message) != message:
+            self._redact_message(record, message)
+        if record.exc_info and not record.exc_text:
+            # Formatters reuse a cached exc_text, so every handler prints this one.
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = _redact(record.exc_text)
+        if record.stack_info:
+            record.stack_info = _redact(record.stack_info)
         return True
+
+    @staticmethod
+    def _redact_message(record: logging.LogRecord, message: str) -> None:
+        if isinstance(record.args, tuple) and isinstance(record.msg, str):
+            # Redact the string arguments in place, keeping their shape: uvicorn's
+            # access formatter unpacks record.args (client, method, path, ...).
+            record.msg = _redact(record.msg)
+            record.args = tuple(_redact(a) if isinstance(a, str) else a for a in record.args)
+            result = record.getMessage()
+            if _redact(result) == result:
+                return
+        # A secret in a non-string argument, e.g. an httpx.URL: flatten the message.
+        record.msg, record.args = _redact(message), None
 
 
 _REDACT_SECRETS = RedactSecretsFilter()
+
+
+def uvicorn_log_config() -> dict[str, Any]:
+    """uvicorn's default logging config, with secrets redacted on its handlers too.
+
+    uvicorn logs through its own handlers (``uvicorn.access`` doesn't propagate to
+    the root logger), so a Plex webhook URL's ``?token=<secret>`` would otherwise
+    be printed to the console by the access log.
+    """
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config.setdefault("filters", {})["redact_secrets"] = {"()": RedactSecretsFilter}
+    for handler in config.get("handlers", {}).values():
+        handler.setdefault("filters", []).append("redact_secrets")
+    return config
 
 
 def setup_logging(level: str, log_file: str = "", log_file_lines: int = 10000) -> None:
@@ -378,6 +423,7 @@ def run() -> None:
             host=settings.webhook_host,
             port=settings.webhook_port,
             log_level=settings.log_level,
+            log_config=uvicorn_log_config(),
         )
     else:
         components = build_components(settings)
