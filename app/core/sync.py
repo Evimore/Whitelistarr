@@ -248,16 +248,21 @@ class LabelSync:
         changed = 0
         added: dict[str, dict[str, list[str]]] = {}
         removed: dict[str, dict[str, list[str]]] = {}
-        for item in self._plex.iter_items():
-            processed += 1
-            try:
-                item_changed, to_add, to_remove = self._reconcile_item(item, index)
-                if item_changed:
-                    changed += 1
-                self._collect_label_changes(item, to_add, to_remove, added, removed)
-            except Exception:  # noqa: BLE001 - one bad item shouldn't abort the sweep
-                log.exception("Failed to sync item: %s", getattr(item, "title", "?"))
-        self._notify_label_changes(added, removed)
+        try:
+            for item in self._plex.iter_items():
+                processed += 1
+                try:
+                    item_changed, to_add, to_remove = self._reconcile_item(item, index)
+                    if item_changed:
+                        changed += 1
+                    self._collect_label_changes(item, to_add, to_remove, added, removed)
+                except Exception:  # noqa: BLE001 - one bad item shouldn't abort the sweep
+                    log.exception("Failed to sync item: %s", getattr(item, "title", "?"))
+        finally:
+            # Announce what already changed even if listing Plex failed partway
+            # (e.g. Plex dropped mid-sweep): those labels are applied, and their
+            # state is recorded, so a later sweep would never announce them.
+            self._notify_label_changes(added, removed)
         log.info("Sweep complete: processed=%d changed=%d", processed, changed)
         return {"processed": processed, "changed": changed}
 

@@ -352,3 +352,26 @@ def test_reverse_sweep_dry_run_does_not_mutate():
     summary = sync.reverse_sweep()
     assert summary["changed"] == 1
     assert item.labels() == {"mika-whitelist"}  # dry run: not mutated
+
+
+def test_sweep_announces_changes_made_before_plex_failed_midway():
+    import pytest
+    import requests
+
+    dune = FakePlexItem("Dune", "movie", labels=set(), guid_keys={"tmdb:1"}, rating_key="1")
+
+    class DropsMidway(FakePlex):
+        def iter_items(self):  # first library listed, then Plex goes away
+            yield dune
+            raise requests.exceptions.ConnectionError("Plex went away")
+
+    notifier = FakeNotifier()
+    state = StateStore(":memory:")
+    sync = _labeled_sync(DropsMidway([dune]), [({"tmdb:1"}, ["kids"])], notifier, state)
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        sync.sweep()  # the sweep still fails...
+
+    assert dune.labels() == {"kids-allowed"}
+    assert [title for title, _, _ in notifier.sent] == ["Label Added"]  # ...but announces Dune
+    assert "Dune" in notifier.sent[0][1]
