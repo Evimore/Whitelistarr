@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
+from app.clients.plex import PlexUnavailableError
 from app.config import Settings
 from app.config_schema import CONFIG_SCHEMA, field_keys, secret_keys
 from app.onboarding import next_incomplete_step
@@ -88,16 +89,25 @@ def _make_test_client(service: str, url: str, key: str) -> tuple[Any, bool]:
     return None, False
 
 
-def _make_plex_client(url: str, token: str) -> Any:
+def _make_plex_client(
+    url: str, token: str, device_name: str = "Whitelistarr", client_id: str = "whitelistarr"
+) -> Any:
     """Build a throwaway Plex client from saved creds for read-only listing.
 
     Used mid-onboarding when the live components aren't built yet (config still
     incomplete) but Plex is already signed in — the library picker only needs the
-    Plex URL + token, not the rest of the config.
+    Plex URL + token, not the rest of the config. Pass this install's identity:
+    PlexClient sets plexapi's identity headers process-wide.
     """
     from app.clients.plex import PlexClient
 
-    return PlexClient(url, token)
+    return PlexClient(url, token, device_name=device_name, client_id=client_id)
+
+
+def _plex_unavailable(action: str, exc: PlexUnavailableError) -> Response:
+    log.warning("%s not run: %s", action, exc)
+    # Only the fixed reason code reaches the browser, never the message/URL.
+    return JSONResponse({"error": "Plex unavailable", "reason": exc.reason}, status_code=503)
 
 
 def _static_response(name: str) -> Response:
@@ -189,7 +199,12 @@ def create_webui_router(
         ls = runtime.label_sync
         if ls is None:
             return JSONResponse({"error": "Not configured"}, status_code=409)
-        result = ls.sweep()
+        # Off the event loop: a sweep can take minutes on a big library, and the
+        # UI, webhooks and /health (the container health check) share this loop.
+        try:
+            result = await run_in_threadpool(ls.sweep)
+        except PlexUnavailableError as exc:
+            return _plex_unavailable("Sweep", exc)
         _log_action("sweep", result)
         return JSONResponse(result)
 
@@ -204,7 +219,10 @@ def create_webui_router(
             body = {}
         if not body.get("confirm"):
             return JSONResponse({"error": "confirm required"}, status_code=400)
-        result = ls.reverse_sweep()
+        try:
+            result = await run_in_threadpool(ls.reverse_sweep)
+        except PlexUnavailableError as exc:
+            return _plex_unavailable("Reverse", exc)
         _log_action("reverse", result)
         return JSONResponse(result)
 
@@ -215,7 +233,7 @@ def create_webui_router(
         settings = runtime.settings
         if not settings.apprise_url_list:
             return JSONResponse({"error": "Not configured"}, status_code=409)
-        ok = bool(_send_test_notification(settings))
+        ok = bool(await run_in_threadpool(_send_test_notification, settings))
         _log_action("test-notification", {"ok": ok})
         return JSONResponse({"ok": ok})
 
@@ -352,7 +370,8 @@ def create_webui_router(
     @router.post("/api/plex/pin")
     async def plex_pin(request: Request) -> Response:
         forward_url = str(request.url_for("plex_pin_success"))
-        return JSONResponse(_auth().create_pin(forward_url=forward_url))
+        pin = await run_in_threadpool(_auth().create_pin, forward_url=forward_url)
+        return JSONResponse(pin)
 
     @router.get("/plex/auth/success", name="plex_pin_success")
     async def plex_pin_success() -> Response:
@@ -369,7 +388,13 @@ def create_webui_router(
 
     @router.get("/api/plex/pin/{pin_id}")
     async def plex_pin_poll(pin_id: str) -> Response:
-        token = _auth().poll_pin(pin_id)
+        # The UI polls this every 2s while the user signs in, so a plex.tv hiccup
+        # answers "not yet" (it polls again) rather than a 500 with a traceback.
+        try:
+            token = await run_in_threadpool(_auth().poll_pin, pin_id)
+        except Exception as exc:  # noqa: BLE001 - never surface exception text
+            log.warning("Plex sign-in poll failed: %s", type(exc).__name__)
+            token = None
         if token:
             _store_pin_token(pin_id, token)
         return JSONResponse({"authorized": bool(token)})
@@ -379,7 +404,8 @@ def create_webui_router(
         token = _get_pin_token(pin_id)
         if not token:
             return JSONResponse({"error": "Not authorized yet"}, status_code=409)
-        return JSONResponse({"servers": _auth().list_servers(token)})
+        servers = await run_in_threadpool(_auth().list_servers, token)
+        return JSONResponse({"servers": servers})
 
     @router.post("/api/plex/apply")
     async def plex_apply(request: Request) -> Response:
@@ -416,8 +442,14 @@ def create_webui_router(
             saved = store.load() if store and store.exists() else {}
             url, token = saved.get("plex_url"), saved.get("plex_token")
             if url and token:
+                settings = runtime.settings
                 with contextlib.suppress(Exception):  # unreachable -> empty list below
-                    plex = _make_plex_client(url, token)
+                    plex = _make_plex_client(
+                        url,
+                        token,
+                        device_name=getattr(settings, "plex_device_name", "") or "Whitelistarr",
+                        client_id=getattr(settings, "plex_client_id", "") or "whitelistarr",
+                    )
         if plex is None or not hasattr(plex, "list_libraries"):
             return JSONResponse({"libraries": []})
         try:

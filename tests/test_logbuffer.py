@@ -175,3 +175,63 @@ def test_redact_secrets_filter(message, expected):
     record = _record(logging.INFO, message)
     assert RedactSecretsFilter().filter(record) is True
     assert record.getMessage() == expected
+
+
+def test_setup_logging_redacts_api_keys_in_tracebacks(tmp_path):
+    """httpx's HTTPStatusError text carries the full URL, Tautulli's apikey included."""
+    import httpx
+
+    from app.main import setup_logging
+
+    f = tmp_path / "whitelistarr.log"
+    request = httpx.Request("GET", "http://tautulli:8181/api/v2?apikey=2b53e377f2834eb1&cmd=x")
+    response = httpx.Response(500, request=request)
+    try:
+        setup_logging("info", log_file=str(f))
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            logging.getLogger("app.core.watch_monitor").exception("watch scan failed")
+        text = f.read_text(encoding="utf-8")
+        assert "Traceback" in text and "apikey=<redacted>" in text
+        assert "2b53e377f2834eb1" not in text
+    finally:
+        setup_logging("info")
+
+
+def test_redaction_keeps_uvicorn_access_record_args_usable():
+    # uvicorn's access formatter unpacks record.args, so the filter must redact
+    # them in place rather than flattening the message.
+    from uvicorn.logging import AccessFormatter
+
+    from app.main import RedactSecretsFilter
+
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:5000", "POST", "/webhook/plex?token=hunter2", "1.1", 200), None,
+    )
+    RedactSecretsFilter().filter(record)
+    line = AccessFormatter('%(client_addr)s - "%(request_line)s" %(status_code)s').format(record)
+    assert line == '127.0.0.1:5000 - "POST /webhook/plex?token=<redacted> HTTP/1.1" 200 OK'
+
+
+def test_uvicorn_log_config_redacts_the_access_log():
+    """End to end through uvicorn's own handlers (in a subprocess: dictConfig is global)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, logging.config\n"
+        "from app.main import uvicorn_log_config\n"
+        "logging.config.dictConfig(uvicorn_log_config())\n"
+        "logging.getLogger('uvicorn.access').info('%s - \"%s %s HTTP/%s\" %d',"
+        " '127.0.0.1:5000', 'POST', '/webhook/plex?token=hunter2', '1.1', 200)\n"
+        "logging.getLogger('uvicorn.error').info('GET /x?X-Plex-Token=hunter2')\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
+    )
+    logged = out.stdout + out.stderr
+    assert "/webhook/plex?token=<redacted>" in logged
+    assert "X-Plex-Token=<redacted>" in logged
+    assert "hunter2" not in logged

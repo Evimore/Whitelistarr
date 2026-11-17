@@ -333,8 +333,9 @@ def test_plex_libraries_from_saved_creds_during_onboarding(tmp_path, monkeypatch
     libs = [{"title": "Movies", "type": "movie"}]
     built = {}
 
-    def fake_make_plex_client(url, token):
+    def fake_make_plex_client(url, token, **identity):
         built["url"], built["token"] = url, token
+        built.update(identity)
         return FakePlexLibClient(libs)
 
     monkeypatch.setattr(webui, "_make_plex_client", fake_make_plex_client)
@@ -349,7 +350,7 @@ def test_plex_libraries_from_saved_creds_during_onboarding(tmp_path, monkeypatch
     resp = client.get("/api/plex/libraries")
     assert resp.status_code == 200
     assert resp.json()["libraries"] == libs
-    assert built == {"url": "http://plex:32400", "token": "tok"}
+    assert (built["url"], built["token"]) == ("http://plex:32400", "tok")
 
 
 def test_plex_account_reports_connected_and_username(tmp_path):
@@ -445,3 +446,115 @@ def test_static_confines_to_allowlist(tmp_path):
     assert _static_response("../config.py").status_code == 404
     assert _static_response("js/../store.js").status_code == 404
     assert _static_response("index.html").status_code == 200
+
+
+# --- blocking work runs off the event loop -----------------------------------
+
+import asyncio  # noqa: E402
+
+from app.clients.plex import PlexUnavailableError  # noqa: E402
+
+
+def _where():
+    """Where a sync callable runs: on the event loop, or in a worker thread."""
+    try:
+        asyncio.get_running_loop()
+        return "event loop"
+    except RuntimeError:
+        return "worker thread"
+
+
+def test_action_sweep_runs_off_the_event_loop(tmp_path):
+    # A sweep can take minutes. On the event loop it would freeze the UI, the
+    # webhooks and /health (the container health check) until it finished.
+    seen = []
+    ls = SimpleNamespace(sweep=lambda: seen.append(_where()) or {"processed": 0, "changed": 0})
+    client, _, _ = _client(tmp_path, label_sync=ls)
+    assert client.post("/api/actions/sweep").status_code == 200
+    assert seen == ["worker thread"]
+
+
+def test_action_reverse_runs_off_the_event_loop(tmp_path):
+    seen = []
+    ls = SimpleNamespace(
+        reverse_sweep=lambda: seen.append(_where()) or {"processed": 0, "changed": 0}
+    )
+    client, _, _ = _client(tmp_path, label_sync=ls)
+    assert client.post("/api/actions/reverse", json={"confirm": True}).status_code == 200
+    assert seen == ["worker thread"]
+
+
+def test_action_sweep_503_when_plex_unavailable(tmp_path):
+    def sweep():
+        raise PlexUnavailableError("Can't reach Plex at http://10.0.0.5:32400", reason="unreachable")
+
+    client, _, _ = _client(tmp_path, label_sync=SimpleNamespace(sweep=sweep))
+    resp = client.post("/api/actions/sweep")
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "Plex unavailable", "reason": "unreachable"}
+    assert "10.0.0.5" not in resp.text  # the message stays in the server log
+
+
+def test_plex_sign_in_calls_run_off_the_event_loop(tmp_path):
+    seen = []
+
+    class RecordingAuth(FakePlexAuth):
+        def create_pin(self, forward_url=None):
+            seen.append(("create", _where()))
+            return super().create_pin(forward_url)
+
+        def poll_pin(self, pin_id):
+            seen.append(("poll", _where()))
+            return super().poll_pin(pin_id)
+
+        def list_servers(self, token):
+            seen.append(("servers", _where()))
+            return super().list_servers(token)
+
+    store = ConfigStore(str(tmp_path / "config.json"), KEY)
+    app = FastAPI()
+    app.include_router(create_webui_router(
+        runtime=FakeRuntime(Settings(plex_client_id="cid")), store=store, plex_auth=RecordingAuth()
+    ))
+    client = TestClient(app)
+    client.post("/api/plex/pin")
+    client.get("/api/plex/pin/99")
+    client.get("/api/plex/servers?pin_id=99")
+    assert seen == [("create", "worker thread"), ("poll", "worker thread"),
+                    ("servers", "worker thread")]
+
+
+def test_plex_pin_poll_reports_not_authorized_when_plex_tv_errors(tmp_path):
+    class FlakyAuth(FakePlexAuth):
+        def poll_pin(self, pin_id):
+            raise httpx.ConnectError("plex.tv unreachable")
+
+    store = ConfigStore(str(tmp_path / "config.json"), KEY)
+    app = FastAPI()
+    app.include_router(create_webui_router(
+        runtime=FakeRuntime(Settings(plex_client_id="cid")), store=store, plex_auth=FlakyAuth()
+    ))
+    resp = TestClient(app).get("/api/plex/pin/99")
+    assert resp.status_code == 200
+    assert resp.json() == {"authorized": False}
+
+
+def test_library_picker_client_uses_this_installs_plex_identity(tmp_path, monkeypatch):
+    # PlexClient sets plexapi's identity headers process-wide, so the throwaway
+    # client must not reset them to a generic id.
+    import app.webui as webui
+
+    built = {}
+
+    def fake_make_plex_client(url, token, **identity):
+        built.update(identity)
+        return FakePlexLibClient([])
+
+    monkeypatch.setattr(webui, "_make_plex_client", fake_make_plex_client)
+    store = ConfigStore(str(tmp_path / "config.json"), KEY)
+    store.save({"plex_url": "http://plex:32400", "plex_token": "tok"})
+    settings = Settings(plex_client_id="cid-123", plex_device_name="Den")
+    app = FastAPI()
+    app.include_router(create_webui_router(runtime=FakeRuntime(settings), store=store))
+    TestClient(app).get("/api/plex/libraries")
+    assert built == {"device_name": "Den", "client_id": "cid-123"}

@@ -123,6 +123,15 @@ class TestWebhookEndpoint:
             json={"notification_type": "MEDIA_AVAILABLE", "media": {"media_type": "movie", "tmdbId": "1"}},
         )
         assert resp.status_code == 200
+
+    def test_non_ascii_secret_and_token_are_compared_not_crashed_on(self):
+        sync = FakeSync()
+        client = _client(sync, secret="clé-secrète")
+        body = {"notification_type": "MEDIA_AVAILABLE", "media": {"media_type": "movie", "tmdbId": "1"}}
+        assert client.post("/webhook/seerr?token=clé-secrète", json=body).status_code == 200
+        assert client.post("/webhook/seerr?token=ñope", json=body).status_code == 401
+        assert client.post("/webhook/seerr", headers={"X-Webhook-Secret": "s3cret"},
+                           json=body).status_code == 401
         assert sync.calls == [("movie", 1, None)]
 
 

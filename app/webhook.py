@@ -7,6 +7,7 @@ Accepts two trigger sources, both optional:
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from collections.abc import Callable
@@ -104,7 +105,8 @@ def create_app(
         provided = request.query_params.get("token") or request.headers.get(
             "X-Webhook-Secret"
         )
-        return provided == secret
+        # Constant-time, on bytes: compare_digest rejects non-ASCII str input.
+        return hmac.compare_digest((provided or "").encode(), secret.encode())
 
     @app.get("/health")
     async def health() -> dict[str, str]:

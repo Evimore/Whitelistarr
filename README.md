@@ -195,10 +195,11 @@ Choose which events notify via `NOTIFY_ON`:
   messages (**Label Added** / **Label Removed**), grouped by media type, listing
   every affected item. Deduplicated per item and label. Requires only
   `APPRISE_URLS`.
-- **`watched`** — the requester watched an item past `WATCHED_PERCENT` (default
-  85%). Requires Tautulli and `FEATURE_NOTIFY=true`.
-- **`stale`** — an item is older than `STALE_AFTER_DAYS` and unwatched for
-  `UNWATCHED_AFTER_DAYS`. Requires Tautulli and `FEATURE_NOTIFY=true`.
+- **`watched`** — the requester watched a movie past `WATCHED_PERCENT` (default
+  85%). Movies only. Requires Tautulli and `FEATURE_NOTIFY=true`.
+- **`stale`** — a movie or show is older than `STALE_AFTER_DAYS` and the
+  requester hasn't watched it for `UNWATCHED_AFTER_DAYS`. For a show, watching any
+  episode counts. Requires Tautulli and `FEATURE_NOTIFY=true`.
 
 With `DRY_RUN=true`, notifications are logged but not sent. To confirm your
 channels work, use the **Send test notification** button in the web UI's Actions
@@ -321,6 +322,29 @@ scan. See [`.github/workflows/`](.github/workflows/) for the full pipeline.
 
 ## Troubleshooting
 
+### Labels don't show up in Plex
+
+If the log shows a line like this (with no `[DRY_RUN]` prefix), the label was
+written to Plex:
+
+```
+INFO app.core.labeler Dune [tmdb:438631]: +['kids-allowed'] -
+```
+
+Whitelistarr writes Plex **labels**, not collections, because labels are what a
+share restriction filters on (see
+[Restricting a shared user to the label](#restricting-a-shared-user-to-the-label)).
+Plex doesn't show labels on the item's page. To see them:
+
+- Open the item's **Edit** dialog. Labels are listed in the **Tags** section.
+- Or filter the library by **Label**.
+
+Plex capitalizes the first letter, so `kids-allowed` shows as `Kids-allowed`.
+
+**Want a collection too?** Filter the library by the label, then save that
+filter as a **Smart Collection**. It stays up to date as Whitelistarr labels and
+unlabels items, and the label keeps controlling what shared users can see.
+
 ### `*.plex.direct` URLs and DNS-rebinding protection
 
 **Sign in with Plex** gives you Plex's secure URLs, such as
@@ -358,7 +382,8 @@ Fix it with any one of these. Jobs resume on their own once Plex answers.
 ## Limitations
 
 - Movies and TV shows only.
-- TV "fully watched" is approximate (a percent threshold); movies are exact.
+- The `watched` notification covers movies only. TV shows get `stale`
+  notifications.
 - GUID matching depends on correct Plex agent metadata; unmatched items are logged
   during the sweep.
 - Seerr → Radarr/Sonarr requester tagging must already be enabled.

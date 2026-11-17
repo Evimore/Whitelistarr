@@ -94,3 +94,21 @@ def test_headless_mode_ignores_onboarding_flag(monkeypatch, tmp_path):
     built = _spy_build(monkeypatch)
     main.create_application(_configured_settings())  # feature_ui=False, flag default False
     assert built["n"] == 1
+
+
+def test_dry_run_reaches_the_watch_monitor(tmp_path):
+    # The monitor must know about DRY_RUN itself: the notifier only logs in dry
+    # run, and the monitor must then not record events as sent.
+    settings = Settings(
+        plex_url="http://plex:32400", plex_token="t",
+        radarr_url="http://radarr:7878", radarr_api_key="rk",
+        sonarr_url="http://sonarr:8989", sonarr_api_key="sk",
+        tag_label_map="a:b",
+        feature_ui=False, feature_notify=True, dry_run=True,
+        seerr_url="http://seerr:5055", seerr_api_key="ok",
+        tautulli_url="http://tautulli:8181", tautulli_api_key="tk",
+        apprise_urls="json://localhost",
+        state_db_path=str(tmp_path / "state.db"),
+    )
+    components = main.build_components(settings)
+    assert components.watch_monitor._dry_run is True
