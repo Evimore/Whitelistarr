@@ -181,3 +181,114 @@ def test_recently_added_ignores_items_at_or_before_watermark():
     summary = poller.poll()
     assert summary["added"] == 0
     assert old.labels() == set()
+
+
+# --- failures are retried, not dropped ----------------------------------------
+
+import requests  # noqa: E402
+
+from app.core.reactive import MAX_ATTEMPTS  # noqa: E402
+
+
+class FlakyItem(FakePlexItem):
+    """A Plex item whose label edits raise ``exc`` for the first ``fails`` attempts."""
+
+    def __init__(self, *args, fails=1, exc=RuntimeError("boom"), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fails, self.exc, self.attempts = fails, exc, 0
+
+    def add_labels(self, labels):
+        self.attempts += 1
+        if self.attempts <= self.fails:
+            raise self.exc
+        super().add_labels(labels)
+
+
+class RefetchPlex(FakePlex):
+    def fetch_labelable(self, rating_key):
+        for item in self._items:
+            if item.rating_key == rating_key:
+                return item
+        return None
+
+
+def _two_movies(first):
+    second = FakePlexItem("Arrival", "movie", set(), {"tmdb:2"}, rating_key="2")
+    radarr = FakeArr([({"tmdb:1"}, []), ({"tmdb:2"}, [])])
+    poller = make_poller(FakePlex([first, second]), radarr=radarr, now=datetime(2026, 1, 1))
+    poller.poll()  # baseline
+    radarr.set([({"tmdb:1"}, ["kids"]), ({"tmdb:2"}, ["kids"])])
+    return poller, second
+
+
+def test_failed_tag_change_is_retried_next_poll_and_others_still_apply():
+    first = FlakyItem("Dune", "movie", set(), {"tmdb:1"}, rating_key="1")
+    poller, second = _two_movies(first)
+
+    poller.poll()
+    assert first.labels() == set()            # failed this poll...
+    assert second.labels() == {"kids-allowed"}  # ...without stopping the other change
+
+    poller.poll()
+    assert first.labels() == {"kids-allowed"}  # retried and applied
+
+
+def test_plex_unreachable_mid_poll_keeps_every_change_for_next_poll():
+    first = FlakyItem("Dune", "movie", set(), {"tmdb:1"}, rating_key="1",
+                      exc=requests.exceptions.ConnectionError("refused"))
+    poller, second = _two_movies(first)
+
+    poller.poll()
+    assert first.labels() == set() and second.labels() == set()  # stopped at Plex down
+
+    poller.poll()
+    assert first.labels() == {"kids-allowed"}
+    assert second.labels() == {"kids-allowed"}
+
+
+def test_plex_outage_does_not_use_up_attempts():
+    first = FlakyItem("Dune", "movie", set(), {"tmdb:1"}, rating_key="1",
+                      fails=MAX_ATTEMPTS + 2, exc=requests.exceptions.ConnectionError("down"))
+    poller, _ = _two_movies(first)
+    for _ in range(MAX_ATTEMPTS + 3):
+        poller.poll()
+    assert first.labels() == {"kids-allowed"}  # applied once Plex was back
+
+
+def test_change_that_keeps_failing_is_left_to_the_sweep():
+    first = FlakyItem("Dune", "movie", set(), {"tmdb:1"}, rating_key="1", fails=10**6)
+    poller, _ = _two_movies(first)
+    for _ in range(MAX_ATTEMPTS + 3):
+        poller.poll()
+    assert first.attempts == MAX_ATTEMPTS  # no retry storm every minute
+
+
+def test_failed_recently_added_item_is_refetched_and_retried():
+    t0 = datetime(2026, 1, 1)
+    movie = FlakyItem("Dune", "movie", set(), {"tmdb:1"}, rating_key="1",
+                      added_at=t0 + timedelta(minutes=5))
+    plex = RefetchPlex(items=[movie], recent=[])
+    poller = make_poller(plex, radarr=FakeArr([({"tmdb:1"}, ["kids"])]), now=t0)
+    poller.poll()             # baseline
+    plex._recent = [movie]
+
+    assert poller.poll()["added"] == 0  # reconcile failed
+    plex._recent = []                   # the watermark has moved past it
+    assert poller.poll()["added_titles"] == ["Dune"]
+    assert movie.labels() == {"kids-allowed"}
+
+
+def test_recently_added_item_is_retried_after_plex_outage():
+    t0 = datetime(2026, 1, 1)
+    movie = FlakyItem("Dune", "movie", set(), {"tmdb:1"}, rating_key="1",
+                      added_at=t0 + timedelta(minutes=5),
+                      fails=MAX_ATTEMPTS + 2, exc=requests.exceptions.ConnectionError("down"))
+    plex = RefetchPlex(items=[movie], recent=[])
+    poller = make_poller(plex, radarr=FakeArr([({"tmdb:1"}, ["kids"])]), now=t0)
+    poller.poll()
+    plex._recent = [movie]
+    poller.poll()
+    plex._recent = []
+    for _ in range(MAX_ATTEMPTS + 2):
+        poller.poll()
+    assert movie.labels() == {"kids-allowed"}
